@@ -3,6 +3,18 @@
         "stdio.h": "c",
         "task.h": "c",
         "freertos.h": "c",
-        "gpio.h": "c"
+        "gpio.h": "c",
+        "i2c.h": "c",
+        "ssd1306.h": "c",
+        "esp_log.h": "c",
+        "font8x8_basic.h": "c",
+        "*.inc": "c",
+        "*.tcc": "c",
+        "cmath": "c",
+        "functional": "c",
+        "random": "c",
+        "regex": "c",
+        "type_traits": "c",
+        "ratio": "c"
     }
 }
