@@ -15,6 +15,23 @@
         "random": "c",
         "regex": "c",
         "type_traits": "c",
-        "ratio": "c"
+        "ratio": "c",
+        "vl53l1_platform.h": "c",
+        "vl53l1x_api.h": "c",
+        "spi_master.h": "c",
+        "string.h": "c",
+        "math.h": "c",
+        "i2c_master.h": "c",
+        "hal_utils.h": "c",
+        "soc_caps.h": "c",
+        "i2c_types.h": "c",
+        "complex": "c",
+        "fstream": "c",
+        "queue.h": "c",
+        "optional": "c",
+        "system_error": "c",
+        "array": "c",
+        "tuple": "c",
+        "utility": "c"
     }
 }

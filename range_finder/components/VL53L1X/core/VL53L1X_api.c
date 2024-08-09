@@ -62,7 +62,7 @@
  * @brief Functions implementation
  */
 
-#include "VL53L1X_api.h"
+#include "vl53l1x_api.h"
 #include <string.h>
 
 #if 0
