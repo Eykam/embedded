@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include <string.h>
 
 #include "vl53l1x_api.h"
 #include "ssd1306.h"

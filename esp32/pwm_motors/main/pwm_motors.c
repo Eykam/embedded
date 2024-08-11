@@ -2,7 +2,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_log.h"
 
+#define configTICK_RATE_HZ 10000
 #define DIR GPIO_NUM_26
 #define STEP GPIO_NUM_25
 
@@ -17,21 +19,20 @@ void stepper_task(void *params)
 
     gpio_set_direction(DIR, GPIO_MODE_OUTPUT);
     gpio_set_direction(STEP, GPIO_MODE_OUTPUT);
+    gpio_set_level(DIR, 1);
 
     while(true) {
-        gpio_set_level(DIR, 1);
-
         for(int i = 0; i < 200; i++) {  // 200 steps for a full rotation (adjust as needed)
             gpio_set_level(STEP, 1);
-            esp_rom_delay_us(2);  // Small delay to ensure the step pulse is registered
+            esp_rom_delay_us(1);  // Small delay to ensure the step pulse is registered
+            
             gpio_set_level(STEP, 0);
-            vTaskDelay(delay_ticks );
+            vTaskDelay(1);
 
-            // Yield to other tasks to prevent watchdog triggers
-            if ((i % 50) == 0) {
-                vTaskDelay(1);
-            }
+            // Yield to other tasks to prevent watchdog triggers    
         }
+
+        vTaskDelay(1);
     }
 }
 

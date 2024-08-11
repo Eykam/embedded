@@ -32,6 +32,8 @@
         "system_error": "c",
         "array": "c",
         "tuple": "c",
-        "utility": "c"
+        "utility": "c",
+        "iterator": "c",
+        "cstring": "c"
     }
 }
