@@ -14,7 +14,7 @@
 #define HORIZONTAL_STEP GPIO_NUM_25
 #define HORIZONTAL_STEPPER_SWITCH GPIO_NUM_23
 
-#define VERICAL_DIR GPIO_NUM_14
+#define VERTICAL_DIR GPIO_NUM_32
 #define VERTICAL_STEP GPIO_NUM_27
 #define VERTICAL_STEPPER_SWITCH GPIO_NUM_22
 
@@ -63,7 +63,6 @@ void display_scan_status(void *parameters){
 
     // Concatenate the text
     memcpy(l1_buffer,l1, l1_len);
-    ESP_LOGI(tag, "l1_buffer: %s", l1_buffer);    
     ssd1306_display_text(&dev, 0, l1_buffer, screen_width, false);
 
     int prev_vert_status = 0;
@@ -80,28 +79,33 @@ void display_scan_status(void *parameters){
             char l3_buffer [screen_width];
 
             if (vert_status == 1){
-                memcpy(l2_buffer,"Motor 1: On", 12);
+                memcpy(l2_buffer,"Vertical: On", 13);
             }else{
-                memcpy(l2_buffer,"Motor 1: Off", 13);
+                memcpy(l2_buffer,"Vertical: Off", 14);
             }
 
             if (horiz_status == 1){
-                memcpy(l3_buffer,"Motor 2: On", 12);
+                memcpy(l3_buffer,"Horizontal: On", 15);
             }else{
-                memcpy(l3_buffer,"Motor 2: Off", 13);
+                memcpy(l3_buffer,"Horizontal: Off", 16);
             }
 
             ssd1306_display_text(&dev, 1, l2_buffer, screen_width, false);
             ssd1306_display_text(&dev, 2, l3_buffer, screen_width, false);
-        }
 
+            prev_horiz_status = horiz_status;
+            prev_vert_status = vert_status;
+        }
+        
         vTaskDelay(100);
     }
 }
 
 void stepper_horizontal(void *params)
 {
-    // int spr = 200;
+    int spr = 200;
+    int _switch = 0;
+
     // int rpm  = 100;
     // int microsteps = 1;
 
@@ -112,8 +116,29 @@ void stepper_horizontal(void *params)
     gpio_set_direction(HORIZONTAL_STEP, GPIO_MODE_OUTPUT);
     gpio_set_level(HORIZONTAL_DIR, 1);
 
+    int count = 1;
+
     while(true) {
+        
         if (gpio_get_level(HORIZONTAL_STEPPER_SWITCH) == 1) {
+            // int overflow = count % spr;
+
+            // if (overflow == 0){    
+            //     count = 0;
+
+            //     if (_switch == 0){
+            //         _switch = 1;
+            //     }
+            //     else{
+            //         _switch = 0;
+            //     }
+
+            //     gpio_set_level(HORIZONTAL_DIR, _switch);
+            //     vTaskDelay(10);
+            // }
+
+            // count++;
+
             gpio_set_level(HORIZONTAL_STEP, 1);
             esp_rom_delay_us(1);  // Small delay to ensure the step pulse is registered
                 
@@ -127,30 +152,54 @@ void stepper_horizontal(void *params)
 
 void stepper_vertical(void *params)
 {
-    int height = 160;
+    int MAX_HEIGHT = 3300;
+    int _switch = 0;
 
-    gpio_set_direction(VERICAL_DIR, GPIO_MODE_OUTPUT);
+    gpio_set_direction(VERTICAL_DIR, GPIO_MODE_OUTPUT);
     gpio_set_direction(VERTICAL_STEP, GPIO_MODE_OUTPUT);
-    gpio_set_level(VERICAL_DIR, 1);
+    gpio_set_level(VERTICAL_DIR, _switch);
+    
+    
+    int count = 1;
 
-    while(true && height < VERTICAL_STEP_LENGTH) {
+    while(true) {
       
       if (gpio_get_level(VERTICAL_STEPPER_SWITCH) == 1) {
+        int overflow = count % MAX_HEIGHT;
+
+        if (overflow == 0){
+            ESP_LOGI(tag, "Oveflowed, switching directions => %d", _switch);   
+            ESP_LOGI(tag, "Count => %d", count);               
+            
+            count = 0;
+
+            if (_switch == 0){
+                _switch = 1;
+            }
+            else{
+                _switch = 0;
+            }
+
+            gpio_set_level(VERTICAL_DIR, _switch);
+            vTaskDelay(10);
+        }
+
+        count++; 
+
         gpio_set_level(VERTICAL_STEP, 1);
         esp_rom_delay_us(1);  // Small delay to ensure the step pulse is registered
             
         gpio_set_level(VERTICAL_STEP, 0);
-        height++;
       }
      
         // Yield to other tasks to prevent watchdog triggers    
-        vTaskDelay(100);
+        vTaskDelay(1);
     }
 }
 
 void app_main(void)
 {
- // Create the display_range task
+    //  Create the display_range task
     xTaskCreate(
         display_scan_status,      // Function that implements the task
         "display_scan_status_task", // Text name for the task
@@ -162,5 +211,4 @@ void app_main(void)
 
     xTaskCreate(stepper_vertical, "stepper_vertical_task", 2048, NULL, 6, NULL);
     xTaskCreate(stepper_horizontal, "stepper_horizontal_task", 2048, NULL, 6, NULL);
-
 }
