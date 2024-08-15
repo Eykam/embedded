@@ -34,6 +34,11 @@
         "tuple": "c",
         "utility": "c",
         "iterator": "c",
-        "cstring": "c"
+        "cstring": "c",
+        "timer.h": "c",
+        "esp_attr.h": "c",
+        "gptimer.h": "c",
+        "gptimer_etm.h": "c",
+        "sdkconfig.h": "c"
     }
 }
