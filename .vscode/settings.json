@@ -39,6 +39,7 @@
         "esp_attr.h": "c",
         "gptimer.h": "c",
         "gptimer_etm.h": "c",
-        "sdkconfig.h": "c"
+        "sdkconfig.h": "c",
+        "vl53l1_types.h": "c"
     }
 }

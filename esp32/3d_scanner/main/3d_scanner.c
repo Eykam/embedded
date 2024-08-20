@@ -3,12 +3,28 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
 #include "driver/gptimer.h"
 #include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_err.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include <string.h>
+#include "freertos/portable.h"
+
+#include "vl53l1x_api.h"
+#include "ssd1306.h"
+
+
+#define tag "3d_scanner"
+
+#define MAX_INT_DIGITS 11  // Enough for 32-bit int (-2147483648 to 2147483647)
+#define sensorDev (uint16_t) 0x52
+
+#define VL53L1X_SDA_IO 17
+#define VL53L1X_SCL_IO 16
+
 
 #define DOWN 0
 #define UP 1
@@ -31,7 +47,7 @@
 #define VERTICAL_INTERVAL_SEC (0.001)  // 1 ms per vertical step
 
 static volatile bool vertical_done = false;
-static gptimer_handle_t horizontal_timer = NULL;
+    static gptimer_handle_t horizontal_timer = NULL;
 static gptimer_handle_t vertical_timer = NULL;
 volatile bool load_position_flag = false;
 
@@ -141,6 +157,7 @@ void recalibrate_vertical_rail() {
 // }
 
 
+
 static bool IRAM_ATTR horizontal_timer_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data) {
     static int horizontal_step_count = 0;
 
@@ -245,6 +262,155 @@ void init_gptimer(gptimer_handle_t *timer, double timer_interval_sec, gptimer_al
     }
 }
 
+
+void find_range(void *parameters) {
+    QueueHandle_t xQueue = (QueueHandle_t)parameters;
+
+
+    #if CONFIG_I2C_INTERFACE
+        ESP_LOGI(tag, "Configuring RangeFinder I2C");
+        ESP_LOGI(tag, "RangeFinder SDA => %d", VL53L1X_SDA_IO);
+        ESP_LOGI(tag, "RangeFinder SCL => %d", VL53L1X_SCL_IO);
+        VL53L1X_I2C_init(VL53L1X_SDA_IO, VL53L1X_SCL_IO, CONFIG_RESET_GPIO);
+    #endif // CONFIG_I2C_INTERFACE
+
+
+    ESP_LOGI(tag, "Booting RangeFinder...");
+    uint8_t state = 0;
+    int boot_status;
+
+    while(state == 0) {
+        
+        boot_status = VL53L1X_BootState(sensorDev, &state);
+        ESP_LOGI(tag, "RangeFinder boot_status: %d   state: %d", boot_status, state);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    ESP_LOGI(tag, "RangeFinder Booted! Intializing...");
+    /* Sensor Initialization */
+    VL53L1X_SensorInit(sensorDev);
+    ESP_LOGI(tag, "RangeFinder Intialized!");
+    
+    // Set a faster timing budget for higher frequency measurements
+    VL53L1X_SetTimingBudgetInMs(sensorDev, 10); // 10ms timing budget
+    VL53L1X_SetInterMeasurementInMs(sensorDev, 10); // 10ms between measurements
+
+    VL53L1X_StartRanging(sensorDev);
+    ESP_LOGI(tag, "Started Ranging at 100Hz!");
+
+    TickType_t xLastWakeTime;
+    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms interval for 100Hz
+
+    xLastWakeTime = xTaskGetTickCount();
+
+    /* ranging loop */
+    while(true){
+        uint8_t dataReady = 0;
+        uint8_t rangeStatus;
+        uint16_t distance;
+
+        while (dataReady == 0) {
+            VL53L1X_CheckForDataReady(sensorDev, &dataReady);
+            
+            if (dataReady == 0) {
+                vTaskDelayUntil(&xLastWakeTime, 1); // Short delay if data not ready
+            }
+        }
+
+        
+        VL53L1X_GetRangeStatus(sensorDev, &rangeStatus);
+        VL53L1X_GetDistance(sensorDev, &distance);
+        VL53L1X_ClearInterrupt(sensorDev);
+        
+        if (rangeStatus == 0) { // 0 indicates a valid measurement
+            ESP_LOGI(tag, "Distance: %d mm", distance);
+            if (xQueueSend(xQueue, &distance, 0) != pdPASS) {
+                ESP_LOGW(tag, "Failed to send data to display queue");
+            }
+        } else {
+            ESP_LOGW(tag, "Invalid measurement, status: %d", rangeStatus);
+        }
+
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+void display_range(void *parameters){
+    SSD1306_t dev;
+
+    QueueHandle_t xQueue = (QueueHandle_t)parameters;  
+    uint16_t receivedValue;
+    uint16_t displayValue = 0;
+    int updateCounter = 0;
+    const int updateFrequency = 10;
+
+    int screen_width = 128;  // Width of the SSD1306 display in pixels
+    int char_width = 6;      // Width of each character in pixels
+
+    // ======================================= Setup =======================================
+    #if CONFIG_I2C_INTERFACE
+        ESP_LOGI(tag, "Configuring LCD I2C");
+        ESP_LOGI(tag, "LCD SDA => %d",CONFIG_SDA_GPIO);
+        ESP_LOGI(tag, "LCD SCL => %d",CONFIG_SCL_GPIO);
+        i2c_master_init(&dev, CONFIG_SDA_GPIO, CONFIG_SCL_GPIO, CONFIG_RESET_GPIO);
+    #endif // CONFIG_I2C_INTERFACE
+
+    #if CONFIG_SSD1306_128x64
+        ESP_LOGI(tag, "Panel is 128x64");
+        ssd1306_init(&dev, 128, 64);
+    #endif // CONFIG_SSD1306_128x64
+    #if CONFIG_SSD1306_128x32
+        ESP_LOGI(tag, "Panel is 128x32");
+        ssd1306_init(&dev, 128, 32);
+    #endif // CONFIG_SSD1306_128x32
+    
+
+    gpio_set_direction(GPIO_NUM_5, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_5, 1);            
+    
+    ssd1306_clear_screen(&dev,false);
+
+    // ======================================= Main =======================================
+    char *l1 = "Distance";
+    int l1_len = strlen(l1);
+
+    char l1_buffer[screen_width];     
+    l1_buffer[0] = '\0';            
+
+    for (int i = 1; i < (screen_width - (l1_len * 6)); i++) {
+        l1_buffer[i] = ' ';
+    }
+
+    // Concatenate the text
+    memcpy(l1_buffer,l1, l1_len);
+    ESP_LOGI(tag, "l1_buffer: %s", l1_buffer);    
+    ssd1306_display_text(&dev, 0, l1_buffer, screen_width, false);
+
+    while(true){
+        if (xQueueReceive(xQueue, &receivedValue, 100) == pdPASS) {
+            ESP_LOGI(tag, "Received value: %d", receivedValue);               
+            
+            char l2_buffer [screen_width];
+            snprintf(l2_buffer, sizeof(l2_buffer), 
+                                "%d mm\n\t\t%d cm\n", 
+                                receivedValue, 
+                                receivedValue / 10);
+
+            char l3_buffer [screen_width];
+            snprintf(l3_buffer, sizeof(l3_buffer), 
+                                "%.2f in\n%.2f ft", 
+                                (float)receivedValue / 25.4, 
+                                (float)receivedValue / 304.8);
+
+
+            ssd1306_display_text(&dev, 1, l2_buffer, screen_width, false);
+            ssd1306_display_text(&dev, 2, l3_buffer, screen_width, false);
+        }
+
+        vTaskDelay(10);
+    }
+}
+
 void app_main() {
     // Initialize GPIO pins
     gpio_set_direction(HORIZONTAL_STEP_PIN, GPIO_MODE_OUTPUT);
@@ -258,8 +424,33 @@ void app_main() {
 
     init_nvs();
     recalibrate_vertical_rail();
+    
+
+    QueueHandle_t xQueue;
+    xQueue = xQueueCreate(100, sizeof(uint16_t));  
 
     xTaskCreate(update_vertical_position_task, "vertical_calibration", 2048, NULL, 5, NULL);
+
+    // Create the find_range task
+    xTaskCreate(
+        find_range,         // Function that implements the task
+        "find_range_task",  // Text name for the task
+        4096,               // Stack size in words
+        (void *)xQueue,               // Task input parameter
+        5,                  // Task priority
+        NULL                // Task handle
+    );
+
+    // Create the display_range task
+    xTaskCreatePinnedToCore(
+        display_range,      // Function that implements the task
+        "display_range_task", // Text name for the task
+        4096,               // Stack size in words
+        (void *)xQueue,               // Task input parameter
+        4,                  // Task priority
+        NULL,
+        0               // Task handle
+    );
 
     init_gptimer(&horizontal_timer, HORIZONTAL_INTERVAL_SEC, horizontal_timer_isr_callback, &horizontal_timer);
     init_gptimer(&vertical_timer, VERTICAL_INTERVAL_SEC, vertical_timer_isr_callback, &horizontal_timer);

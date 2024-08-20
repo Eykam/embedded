@@ -70,9 +70,9 @@
 
 #include "vl53l1_platform.h"
 
-#define VL53L1X_address          0x52
-#define VL53L1X_SCL_IO           26       // GPIO number for I2C master clock
-#define VL53L1X_SDA_IO           25        // GPIO number for I2C master data
+#define VL53L1X_address          0x29
+#define VL53L1X_SCL_IO           16       // GPIO number for I2C master clock
+#define VL53L1X_SDA_IO           17        // GPIO number for I2C master data
 
 #define VL53L1X_IMPLEMENTATION_VER_MAJOR       3
 #define VL53L1X_IMPLEMENTATION_VER_MINOR       5
