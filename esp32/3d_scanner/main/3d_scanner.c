@@ -12,10 +12,20 @@
 #include "esp_log.h"
 #include <string.h>
 #include "freertos/portable.h"
+#include "esp_timer.h"
+
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 
 #include "vl53l1x_api.h"
 #include "ssd1306.h"
 
+#define ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
+#define ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
+#define ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
 
 #define tag "3d_scanner"
 
@@ -24,7 +34,6 @@
 
 #define VL53L1X_SDA_IO 17
 #define VL53L1X_SCL_IO 16
-
 
 #define DOWN 0
 #define UP 1
@@ -39,17 +48,30 @@
 #define TIMER_DIVIDER    80        // Hardware timer clock divider
 #define TIMER_SCALE      (TIMER_BASE_CLK / TIMER_DIVIDER)  // Convert timer counter value to ticks per second
 
-#define HORIZONTAL_INTERVAL_SEC (0.01)  // 10 ms interval for Horizontal Motor
+#define HORIZONTAL_INTERVAL_SEC (0.018)  // 10 ms interval for Horizontal Motor
+#define HORIZONTAL_STEPS 100  // Number of steps for the vertical motor
 #define HORIZONTAL_STEPS_PER_REV 200  // Full revolution for horizontal motor
 
 #define VERTICAL_MAX_STEPS 3300
 #define VERTICAL_STEPS 96  // Number of steps for the vertical motor
 #define VERTICAL_INTERVAL_SEC (0.001)  // 1 ms per vertical step
 
+
+/* FreeRTOS event group to signal when we are connected*/
+static EventGroupHandle_t s_wifi_event_group;
+
+/* The event group allows multiple bits for each event, but we only care about two events:
+ * - we are connected to the AP with an IP
+ * - we failed to connect after the maximum amount of retries */
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+
 static volatile bool vertical_done = false;
-    static gptimer_handle_t horizontal_timer = NULL;
+static gptimer_handle_t horizontal_timer = NULL;
 static gptimer_handle_t vertical_timer = NULL;
 volatile bool load_position_flag = false;
+// volatile bool sync_with_tof = false;
 
 void init_nvs() {
     esp_err_t err = nvs_flash_init();
@@ -288,20 +310,22 @@ void find_range(void *parameters) {
 
     ESP_LOGI(tag, "RangeFinder Booted! Intializing...");
     /* Sensor Initialization */
-    VL53L1X_SensorInit(sensorDev);
-    ESP_LOGI(tag, "RangeFinder Intialized!");
+    uint8_t init_status = VL53L1X_SensorInit(sensorDev);
+    ESP_LOGI(tag, "RangeFinder Intialized! %d", init_status);
     
     // Set a faster timing budget for higher frequency measurements
-    VL53L1X_SetTimingBudgetInMs(sensorDev, 10); // 10ms timing budget
-    VL53L1X_SetInterMeasurementInMs(sensorDev, 10); // 10ms between measurements
+    VL53L1X_SetDistanceMode(sensorDev, 1);
+    VL53L1X_SetTimingBudgetInMs(sensorDev, 15); // 10ms timing budget
+    VL53L1X_SetInterMeasurementInMs(sensorDev, 18); // 10ms between measurements
 
     VL53L1X_StartRanging(sensorDev);
     ESP_LOGI(tag, "Started Ranging at 100Hz!");
 
     TickType_t xLastWakeTime;
-    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10ms interval for 100Hz
+    const TickType_t xFrequency = 1; // 10ms interval for 100Hz
 
     xLastWakeTime = xTaskGetTickCount();
+    int counter = 0;
 
     /* ranging loop */
     while(true){
@@ -309,6 +333,8 @@ void find_range(void *parameters) {
         uint8_t rangeStatus;
         uint16_t distance;
 
+        // uint32_t start_time = esp_timer_get_time();
+        
         while (dataReady == 0) {
             VL53L1X_CheckForDataReady(sensorDev, &dataReady);
             
@@ -317,19 +343,27 @@ void find_range(void *parameters) {
             }
         }
 
-        
+  
         VL53L1X_GetRangeStatus(sensorDev, &rangeStatus);
         VL53L1X_GetDistance(sensorDev, &distance);
         VL53L1X_ClearInterrupt(sensorDev);
+      
         
         if (rangeStatus == 0) { // 0 indicates a valid measurement
-            ESP_LOGI(tag, "Distance: %d mm", distance);
-            if (xQueueSend(xQueue, &distance, 0) != pdPASS) {
-                ESP_LOGW(tag, "Failed to send data to display queue");
+            if (counter >= 200){
+                counter = 0;
+                ESP_LOGI(tag,"Read 200 values from sensor!");
             }
+            
+            counter++;
+            // ESP_LOGI(tag, "Distance: %d mm", distance);
+            // if (xQueueSend(xQueue, &distance, 0) != pdPASS) {
+            //     ESP_LOGW(tag, "Failed to send data to display queue");
+            // }
         } else {
             ESP_LOGW(tag, "Invalid measurement, status: %d", rangeStatus);
         }
+
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
@@ -340,12 +374,12 @@ void display_range(void *parameters){
 
     QueueHandle_t xQueue = (QueueHandle_t)parameters;  
     uint16_t receivedValue;
-    uint16_t displayValue = 0;
-    int updateCounter = 0;
-    const int updateFrequency = 10;
+    // uint16_t displayValue = 0;
+    // int updateCounter = 0;
+    // const int updateFrequency = 10;
 
     int screen_width = 128;  // Width of the SSD1306 display in pixels
-    int char_width = 6;      // Width of each character in pixels
+    // int char_width = 6;      // Width of each character in pixels
 
     // ======================================= Setup =======================================
     #if CONFIG_I2C_INTERFACE
@@ -385,33 +419,134 @@ void display_range(void *parameters){
     memcpy(l1_buffer,l1, l1_len);
     ESP_LOGI(tag, "l1_buffer: %s", l1_buffer);    
     ssd1306_display_text(&dev, 0, l1_buffer, screen_width, false);
+    int counter = 0;
 
     while(true){
         if (xQueueReceive(xQueue, &receivedValue, 100) == pdPASS) {
-            ESP_LOGI(tag, "Received value: %d", receivedValue);               
+            // ESP_LOGI(tag, "Received value: %d", receivedValue);               
             
-            char l2_buffer [screen_width];
-            snprintf(l2_buffer, sizeof(l2_buffer), 
-                                "%d mm\n\t\t%d cm\n", 
-                                receivedValue, 
-                                receivedValue / 10);
+            // char l2_buffer [screen_width];
+            // snprintf(l2_buffer, sizeof(l2_buffer), 
+            //                     "%d mm\n\t\t%d cm\n", 
+            //                     receivedValue, 
+            //                     receivedValue / 10);
 
-            char l3_buffer [screen_width];
-            snprintf(l3_buffer, sizeof(l3_buffer), 
-                                "%.2f in\n%.2f ft", 
-                                (float)receivedValue / 25.4, 
-                                (float)receivedValue / 304.8);
+            // char l3_buffer [screen_width];
+            // snprintf(l3_buffer, sizeof(l3_buffer), 
+            //                     "%.2f in\n%.2f ft", 
+            //                     (float)receivedValue / 25.4, 
+            //                     (float)receivedValue / 304.8);
 
 
-            ssd1306_display_text(&dev, 1, l2_buffer, screen_width, false);
-            ssd1306_display_text(&dev, 2, l3_buffer, screen_width, false);
+            // ssd1306_display_text(&dev, 1, l2_buffer, screen_width, false);
+            // ssd1306_display_text(&dev, 2, l3_buffer, screen_width, false);
+            counter++;
         }
 
-        vTaskDelay(10);
+
+        if (counter >= 200) {
+            ESP_LOGI(tag, "Counter reached 200");
+            counter = 0;  // Reset the counter after logging
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));  // Delay of 10 ms
     }
 }
 
+
+static int s_retry_num = 0;
+
+static void event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < ESP_MAXIMUM_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(tag, "retry to connect to the AP");
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        ESP_LOGI(tag,"connect to the AP fail");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(tag, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = ESP_WIFI_SSID,
+            .password = ESP_WIFI_PASS,
+            /* Setting a password implies station will connect to all security modes including WEP/WPA.
+             * However these modes are deprecated and not advisable to be used. Incase your Access point
+             * doesn't support WPA2, these mode can be enabled by commenting below line */
+	     .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_start() );
+
+    ESP_LOGI(tag, "wifi_init_sta finished.");
+
+    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
+     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
+     * happened. */
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(tag, "connected to ap SSID:%s",
+                 ESP_WIFI_SSID);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(tag, "Failed to connect to SSID:%s",
+                 ESP_WIFI_SSID);
+    } else {
+        ESP_LOGE(tag, "UNEXPECTED EVENT");
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
+    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
+    vEventGroupDelete(s_wifi_event_group);
+}
+
+
+
+
 void app_main() {
+    ESP_LOGI(tag, "[APP] Startup..");
+    ESP_LOGI(tag, "[APP] Free memory: %ld bytes", esp_get_free_heap_size());
+    ESP_LOGI(tag, "[APP] IDF version: %s", esp_get_idf_version());
+
     // Initialize GPIO pins
     gpio_set_direction(HORIZONTAL_STEP_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(HORIZONTAL_DIR_PIN, GPIO_MODE_OUTPUT);
@@ -425,15 +560,17 @@ void app_main() {
     init_nvs();
     recalibrate_vertical_rail();
     
+    // ESP_LOGI(tag, "ESP_WIFI_MODE_STA");
+    // wifi_init_sta();
 
     QueueHandle_t xQueue;
-    xQueue = xQueueCreate(100, sizeof(uint16_t));  
-
+    xQueue = xQueueCreate(100, sizeof(uint16_t)); 
+    
     xTaskCreate(update_vertical_position_task, "vertical_calibration", 2048, NULL, 5, NULL);
 
     // Create the find_range task
     xTaskCreate(
-        find_range,         // Function that implements the task
+                find_range,         // Function that implements the task
         "find_range_task",  // Text name for the task
         4096,               // Stack size in words
         (void *)xQueue,               // Task input parameter

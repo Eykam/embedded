@@ -385,6 +385,14 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# Wifi Config
+#
+CONFIG_ESP_WIFI_SSID="myssid"
+CONFIG_ESP_WIFI_PASSWORD="mypassword"
+CONFIG_ESP_MAXIMUM_RETRY=5
+# end of Wifi Config
+
+#
 # SSD1306 Configuration
 #
 CONFIG_GPIO_RANGE_MAX=33
@@ -617,7 +625,7 @@ CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=y
 # ESP-Driver:I2C Configurations
 #
 # CONFIG_I2C_ISR_IRAM_SAFE is not set
-# CONFIG_I2C_ENABLE_DEBUG_LOG is not set
+CONFIG_I2C_ENABLE_DEBUG_LOG=y
 # end of ESP-Driver:I2C Configurations
 
 #
