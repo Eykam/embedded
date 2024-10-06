@@ -3,7 +3,6 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
-#include "driver/gptimer.h"
 #include "esp_attr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -12,13 +11,14 @@
 #include "esp_log.h"
 #include <string.h>
 #include "freertos/portable.h"
-#include "esp_timer.h"
 
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "lwip/err.h"
+#include "lwip/sockets.h"
 #include "lwip/sys.h"
+#include <lwip/netdb.h>
 
 #include "vl53l1x_api.h"
 #include "ssd1306.h"
@@ -26,6 +26,9 @@
 #define ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
 #define ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
 #define ESP_MAXIMUM_RETRY  CONFIG_ESP_MAXIMUM_RETRY
+
+#define PORT 8035
+#define BUFFER_LENGTH 1500
 
 #define tag "3d_scanner"
 
@@ -44,10 +47,6 @@
 #define VERTICAL_STEP_PIN GPIO_NUM_27
 #define VERTICAL_DIR_PIN GPIO_NUM_32
 
-#define TIMER_BASE_CLK   80000000  // 80 MHz APB clock frequency
-#define TIMER_DIVIDER    80        // Hardware timer clock divider
-#define TIMER_SCALE      (TIMER_BASE_CLK / TIMER_DIVIDER)  // Convert timer counter value to ticks per second
-
 #define HORIZONTAL_INTERVAL_SEC (0.018)  // 10 ms interval for Horizontal Motor
 #define HORIZONTAL_STEPS 100  // Number of steps for the vertical motor
 #define HORIZONTAL_STEPS_PER_REV 200  // Full revolution for horizontal motor
@@ -59,19 +58,52 @@
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
+static EventGroupHandle_t event_group;
+
+#define STATUS_QUEUE_BIT (1 << 0)
+#define POINT_QUEUE_BIT (1 << 1)
+
 
 /* The event group allows multiple bits for each event, but we only care about two events:
  * - we are connected to the AP with an IP
  * - we failed to connect after the maximum amount of retries */
+#define CLIENT_IP <CLIENT_IP_HERE> // IP of client you'd like to connect to
+#define HOST_IP 
+
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
 
-static volatile bool vertical_done = false;
-static gptimer_handle_t horizontal_timer = NULL;
-static gptimer_handle_t vertical_timer = NULL;
-volatile bool load_position_flag = false;
+enum ScannerStatus {
+    OFFLINE,
+    INITIALIZING,
+    READY,
+    SCANNING,
+    PAUSED,
+    DONE,
+    RESTARTING,
+};
+
+
+volatile static int SAMPLES = 1;
+volatile static bool vertical_done = false;
+volatile static bool load_position_flag = false;
+volatile static uint8_t current_vertical_rail_position = 0;
+volatile static enum ScannerStatus Status = OFFLINE;
 // volatile bool sync_with_tof = false;
+
+QueueHandle_t point_queue;
+QueueHandle_t status_queue;
+
+#define QUEUE_SIZE 200
+#define PACKET_SIZE 4  // 64 bits = 8 bytes
+
+typedef struct {
+    uint16_t horizontal_steps;  // 8 bits (8 unused)
+    uint16_t vertical_steps;    // 6 bits (10 bits unused)
+    uint32_t distance_mm;      // 18 bits (14 bits unused)
+} ScannerData;
+
 
 void init_nvs() {
     esp_err_t err = nvs_flash_init();
@@ -109,6 +141,8 @@ void save_vertical_rail_position(int32_t position) {
     if (err != ESP_OK) {
         printf("Failed to commit position to NVS!\n");
     }
+
+    current_vertical_rail_position = truncated_position;
 
     // Close NVS handle
     nvs_close(my_handle);
@@ -164,37 +198,6 @@ void recalibrate_vertical_rail() {
     gpio_set_level(VERTICAL_DIR_PIN, UP);
 }
 
-// void reset_vertical_rail_position(){
-//     gpio_set_level(VERTICAL_DIR_PIN, DOWN);
-    
-//     int count = 0;
-//     while (count < VERTICAL_MAX_STEPS){
-//         gpio_set_level(VERTICAL_STEP_PIN, 1);
-//         esp_rom_delay_us(10); 
-        
-//         gpio_set_level(VERTICAL_STEP_PIN, 0);
-//         esp_rom_delay_us(10); 
-//         count++;
-//     }
-// }
-
-
-
-static bool IRAM_ATTR horizontal_timer_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data) {
-    static int horizontal_step_count = 0;
-
-    gpio_set_level(HORIZONTAL_STEP_PIN, 1);
-    esp_rom_delay_us(10);
-    gpio_set_level(HORIZONTAL_STEP_PIN, 0);
-
-    horizontal_step_count++;
-    if (horizontal_step_count >= HORIZONTAL_STEPS_PER_REV) {
-        horizontal_step_count = 0;
-        gptimer_stop(timer);  // Stop horizontal motor after one full revolution
-        gptimer_start(vertical_timer);  // Start vertical motor steps
-    }
-    return true;  // Return true to continue firing the timer
-}
 
 void update_vertical_position_task(void *pvParameter) {
     while (1) {
@@ -207,80 +210,6 @@ void update_vertical_position_task(void *pvParameter) {
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-static bool IRAM_ATTR vertical_timer_isr_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data) {
-    static int vertical_step_count = 0;
-
-    gpio_set_level(VERTICAL_STEP_PIN, 1);
-    esp_rom_delay_us(10);
-    gpio_set_level(VERTICAL_STEP_PIN, 0);
-
-    vertical_step_count++;
-    if (vertical_step_count >= VERTICAL_STEPS) {
-        vertical_step_count = 0;
-        vertical_done = true;
-        load_position_flag = true;  
-
-        gptimer_stop(timer);  // Stop vertical motor after 96 steps
-
-        // Ensure the user_data is valid and correctly points to horizontal_timer
-        if (user_data != NULL) {
-            if (horizontal_timer != NULL) {
-                esp_err_t err = gptimer_start(horizontal_timer);
-                if (err != ESP_OK) {
-                    printf("Failed to start horizontal timer: %d\n", err);
-                }
-            } else {
-                printf("Error: horizontal_timer is NULL\n");
-            }
-        } else {
-            printf("Error: user_data is NULL\n");
-        }
-    }
-
-    return true;  // Return true to let the timer auto-reload and continue firing
-}
-
-
-void init_gptimer(gptimer_handle_t *timer, double timer_interval_sec, gptimer_alarm_cb_t isr_callback, void *user_data) {
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = TIMER_SCALE,  // Resolution based on the clock and divider
-    };
-    
-    esp_err_t err = gptimer_new_timer(&timer_config, timer);
-    if (err != ESP_OK || timer == NULL) {
-        printf("Failed to initialize timer: %d\n", err);
-        return;
-    }
-
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = isr_callback,
-    };
-    err = gptimer_register_event_callbacks(*timer, &cbs, user_data);
-    if (err != ESP_OK) {
-        printf("Failed to register timer callbacks: %d\n", err);
-        return;
-    }
-
-    gptimer_alarm_config_t alarm_config = {
-        .reload_count = 0,  // Start counting from zero
-        .alarm_count = (uint64_t)(timer_interval_sec * TIMER_SCALE),  // Set the alarm count based on the interval
-        .flags.auto_reload_on_alarm = true,  // Auto-reload the timer on alarm
-    };
-    err = gptimer_set_alarm_action(*timer, &alarm_config);
-    if (err != ESP_OK) {
-        printf("Failed to set timer alarm action: %d\n", err);
-        return;
-    }
-
-    err = gptimer_enable(*timer);
-    if (err != ESP_OK) {
-        printf("Failed to enable timer: %d\n", err);
-        return;
     }
 }
 
@@ -319,53 +248,156 @@ void find_range(void *parameters) {
     VL53L1X_SetInterMeasurementInMs(sensorDev, 18); // 10ms between measurements
 
     VL53L1X_StartRanging(sensorDev);
-    ESP_LOGI(tag, "Started Ranging at 100Hz!");
+    ESP_LOGI(tag, "Started Ranging at 100Hz!\n");
 
     TickType_t xLastWakeTime;
-    const TickType_t xFrequency = 1; // 10ms interval for 100Hz
+    // const TickType_t xFrequency = 1; // 10ms interval for 100Hz
 
     xLastWakeTime = xTaskGetTickCount();
-    int counter = 0;
 
-    /* ranging loop */
-    while(true){
+    ScannerData data;
+    int data_count = 0;
+    int rotations = 0;
+    int sample_count = 0;
+    int total_rotations =  VERTICAL_MAX_STEPS / VERTICAL_STEPS;
+
+    while(true) {
         uint8_t dataReady = 0;
         uint8_t rangeStatus;
         uint16_t distance;
+        uint16_t avg_dist = 0;
 
-        // uint32_t start_time = esp_timer_get_time();
-        
-        while (dataReady == 0) {
-            VL53L1X_CheckForDataReady(sensorDev, &dataReady);
+        switch (Status){
+
+            case SCANNING:
+                // ESP_LOGI(tag,"Starting Sampling for => %d\n", data_count);
+                while (sample_count < SAMPLES  && rotations < total_rotations){
+
+                    // Wait for data to be ready
+                    while (dataReady == 0) {
+                        VL53L1X_CheckForDataReady(sensorDev, &dataReady);
+                        vTaskDelay(1);
+                    }
+
+                    VL53L1X_GetRangeStatus(sensorDev, &rangeStatus);
+                    VL53L1X_GetDistance(sensorDev, &distance);
+                    VL53L1X_ClearInterrupt(sensorDev);
+
+                    if (rangeStatus == 0 || rangeStatus == 4) {
+                        // Signal to step the motor
+                        // ESP_LOGI(tag, "Valid Measurement => [%d] : %d\n", sample_count, distance);
+                        avg_dist += distance;
+                        sample_count++;
+                    } else {
+                        ESP_LOGW(tag, "Invalid measurement, status: %d\n", rangeStatus);
+                    }
+
+                    vTaskDelay(pdMS_TO_TICKS(10)); // Adjust this delay as needed
+                }
+
+                if (rotations == total_rotations){
+                    uint8_t updated_status = (uint8_t) DONE;
+
+                    if (xQueueSend(status_queue, &updated_status, 0) == pdPASS) { 
+                        xEventGroupSetBits(event_group, STATUS_QUEUE_BIT);
+                    }
+                }
+
+                // Obtained Valid Samples
+                if (sample_count == SAMPLES){
+
+                    // Populate data structure
+                    data.horizontal_steps = ++data_count;
+                    data.vertical_steps = rotations * VERTICAL_STEPS;
+                    data.distance_mm = avg_dist / SAMPLES;
+
+                    sample_count = 0;
+                    avg_dist = 0;
+
+                    // Send data to queues
+                    if (xQueueSend(point_queue, &data, 0) == pdPASS) { 
+                        xEventGroupSetBits(event_group, POINT_QUEUE_BIT);
+                    }
+                    if (xQueueSend(xQueue, &distance, 0) != pdPASS) {
+                        ESP_LOGW(tag, "Failed to send data to display queue");
+                    }
+
+
+                    // Step the motor after each measurement
+                    gpio_set_level(HORIZONTAL_STEP_PIN, 1);
+                    esp_rom_delay_us(10);
+                    gpio_set_level(HORIZONTAL_STEP_PIN, 0);
+                
+                }
+
             
-            if (dataReady == 0) {
-                vTaskDelayUntil(&xLastWakeTime, 1); // Short delay if data not ready
-            }
-        }
+                if (data_count == HORIZONTAL_STEPS_PER_REV) {
+                    rotations++;
+                    data_count = 0;
 
-  
-        VL53L1X_GetRangeStatus(sensorDev, &rangeStatus);
-        VL53L1X_GetDistance(sensorDev, &distance);
-        VL53L1X_ClearInterrupt(sensorDev);
-      
-        
-        if (rangeStatus == 0) { // 0 indicates a valid measurement
-            if (counter >= 200){
-                counter = 0;
-                ESP_LOGI(tag,"Read 200 values from sensor!");
-            }
+                    // Trigger vertical step here
+                    int vertical_step_count = 0;
+                    gpio_set_level(VERTICAL_DIR_PIN, 1);
+
+                    while (vertical_step_count < VERTICAL_STEPS){
             
-            counter++;
-            // ESP_LOGI(tag, "Distance: %d mm", distance);
-            // if (xQueueSend(xQueue, &distance, 0) != pdPASS) {
-            //     ESP_LOGW(tag, "Failed to send data to display queue");
-            // }
-        } else {
-            ESP_LOGW(tag, "Invalid measurement, status: %d", rangeStatus);
-        }
+                        gpio_set_level(VERTICAL_STEP_PIN, 1);
+                        esp_rom_delay_us(10);
 
+                        gpio_set_level(VERTICAL_STEP_PIN, 0);
+                        vertical_step_count++;
+                        vTaskDelay(1);
+                    }
 
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+                    load_position_flag = true;
+                }
+                break;
+
+            case INITIALIZING:
+                ESP_LOGI(tag,"Initializing...\n");
+
+                uint8_t updated_status = (uint8_t) INITIALIZING;
+                if (xQueueSend(status_queue, &updated_status, 0) == pdPASS) { 
+                    xEventGroupSetBits(event_group, STATUS_QUEUE_BIT);
+                }
+
+                vTaskDelay(500);
+                break;
+
+            case READY:
+                ESP_LOGI(tag,"Ready for Start Command...\n");
+                vTaskDelay(500);
+                break;
+
+            case PAUSED:
+                ESP_LOGI(tag,"Paused...\n");
+                vTaskDelay(500);
+                break;
+
+            case DONE:
+                ESP_LOGI(tag,"Done! Restart to continue...\n");
+                vTaskDelay(500);
+                break;
+
+            case RESTARTING:
+                ESP_LOGI(tag,"Restarting...\n");
+                data_count = 0;
+                rotations = 0;
+                sample_count = 0;
+                recalibrate_vertical_rail();
+                
+                uint8_t currStatus = (uint8_t) READY; 
+                if (xQueueSend(status_queue, &currStatus, 0) == pdPASS) {
+                    xEventGroupSetBits(event_group, STATUS_QUEUE_BIT);
+                }
+
+                break;
+
+            case OFFLINE:
+                ESP_LOGI(tag,"Offline...\n");
+                vTaskDelay(500);
+                break;
+            }
     }
 }
 
@@ -423,24 +455,29 @@ void display_range(void *parameters){
 
     while(true){
         if (xQueueReceive(xQueue, &receivedValue, 100) == pdPASS) {
-            // ESP_LOGI(tag, "Received value: %d", receivedValue);               
+            // ESP_LOGI(tag, "Received value: %d", receivedValue);  
+
+            if (counter % 10 == 0) {
+
+                char l2_buffer [screen_width];
+                snprintf(l2_buffer, sizeof(l2_buffer), 
+                                    "%d mm\n\t\t%d cm\n", 
+                                    receivedValue, 
+                                    receivedValue / 10);
+
+                char l3_buffer [screen_width];
+                snprintf(l3_buffer, sizeof(l3_buffer), 
+                                    "%.2f in\n%.2f ft", 
+                                    (float)receivedValue / 25.4, 
+                                    (float)receivedValue / 304.8);
+
+
+                ssd1306_display_text(&dev, 1, l2_buffer, screen_width, false);
+                ssd1306_display_text(&dev, 2, l3_buffer, screen_width, false);
+            }             
             
-            // char l2_buffer [screen_width];
-            // snprintf(l2_buffer, sizeof(l2_buffer), 
-            //                     "%d mm\n\t\t%d cm\n", 
-            //                     receivedValue, 
-            //                     receivedValue / 10);
-
-            // char l3_buffer [screen_width];
-            // snprintf(l3_buffer, sizeof(l3_buffer), 
-            //                     "%.2f in\n%.2f ft", 
-            //                     (float)receivedValue / 25.4, 
-            //                     (float)receivedValue / 304.8);
-
-
-            // ssd1306_display_text(&dev, 1, l2_buffer, screen_width, false);
-            // ssd1306_display_text(&dev, 2, l3_buffer, screen_width, false);
             counter++;
+            
         }
 
 
@@ -539,6 +576,199 @@ void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
+void wifi_transmission_task(void *pvParameters) {
+    ScannerData data;
+    uint8_t received_status;
+    
+    // Create a UDP socket
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(CLIENT_IP);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(8035);
+
+    while (1) {
+        if (sock < 0) {
+            ESP_LOGE(tag, "Unable to create socket: errno %d", errno);
+            sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+            continue;
+        }
+
+        // Check both queues without blocking
+        EventBits_t bits = xEventGroupWaitBits(
+            event_group,
+            STATUS_QUEUE_BIT | POINT_QUEUE_BIT,
+            pdTRUE,  // Clear bits before returning
+            pdFALSE,  // Don't wait for all bits
+            0  // Don't block
+        );
+
+        if (bits & STATUS_QUEUE_BIT) {
+            if (xQueueReceive(status_queue, &received_status, 0) == pdPASS) {
+                uint8_t packet[1];
+                packet[0] = received_status;
+                Status = received_status;
+            
+                ESP_LOGI(tag, "Sending status to backend => %d", Status);
+                int err = sendto(sock, packet, sizeof(packet), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+                if (err < 0) {
+                    ESP_LOGE(tag, "Error occurred during sending done command: errno %d", errno);
+                }
+            }
+        }
+
+        if (bits & POINT_QUEUE_BIT) {
+            if (data.vertical_steps < VERTICAL_MAX_STEPS && xQueueReceive(point_queue, &data, 0) == pdPASS) {
+                uint16_t packet[PACKET_SIZE];
+                // Pack data into the packet
+                packet[0] = data.horizontal_steps;
+                packet[1] = data.vertical_steps;  // Only use 6 bits
+                packet[2] = (data.distance_mm >> 8) & 0xFF;  // High byte
+                packet[3] = data.distance_mm & 0xFF;  // Low byte
+
+                int err = sendto(sock, packet, sizeof(packet), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            
+                if (err < 0) {
+                    ESP_LOGE(tag, "Error occurred during sending: errno %d", errno);
+                }
+            }
+        }
+
+        // If neither queue had data, add a small delay to prevent tight-looping
+        if ((bits & (STATUS_QUEUE_BIT | POINT_QUEUE_BIT)) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    shutdown(sock, 0);
+    close(sock);
+}
+
+
+
+void wifi_receiving_task(void *pvParameters){
+    int sock;
+    struct sockaddr_in dest_addr;
+    bool wifi_connected = false;
+
+    // Function to create and bind a socket
+    bool create_bind_socket(int *sock, struct sockaddr_in *addr) {
+        *sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (*sock < 0) {
+            ESP_LOGE(tag, "Unable to create socket: errno %d", errno);
+            return false;
+        }
+        ESP_LOGI(tag, "Socket created");
+
+        addr->sin_addr.s_addr = htonl(INADDR_ANY);
+        addr->sin_family = AF_INET;
+        addr->sin_port = htons(PORT);
+
+        int err = bind(*sock, (struct sockaddr *)addr, sizeof(*addr));
+        if (err < 0) {
+            ESP_LOGE(tag, "Socket unable to bind: errno %d", errno);
+            close(*sock);
+            *sock = -1;
+            return false;
+        }
+        ESP_LOGI(tag, "Socket bound, port %d", PORT);
+        return true;
+    }
+
+
+    // Initially create and bind the socket
+    if (!create_bind_socket(&sock, &dest_addr)) {
+        vTaskDelete(NULL); // Failed to create socket, delete the task
+    }
+
+    while (1) {
+        wifi_ap_record_t ap_info;
+        
+        if (esp_wifi_sta_get_ap_info(&ap_info) == 0) {
+           if (!wifi_connected) {
+                ESP_LOGI(tag, "Wi-Fi reconnected");
+                wifi_connected = true;
+                
+                // Re-create and bind the socket if it was previously closed
+                if (sock == -1) {
+                    if (!create_bind_socket(&sock, &dest_addr)) {
+                        ESP_LOGE(tag, "Failed to rebind socket after Wi-Fi reconnection");
+                        vTaskDelay(pdMS_TO_TICKS(250)); // Retry after a delay
+                        continue;
+                    }
+                }
+            }
+        } else {
+            ESP_LOGW(tag, "Wi-Fi disconnected");
+            wifi_connected = false;
+
+            // Close the socket when disconnected
+            if (sock != -1) {
+                ESP_LOGI(tag, "Closing socket due to Wi-Fi disconnection");
+                shutdown(sock, 0);
+                close(sock);
+                sock = -1;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(250)); // Wait before retrying
+            continue;
+        }
+
+
+        if (sock != -1) {
+            struct sockaddr_in source_addr;
+            socklen_t socklen = sizeof(source_addr);
+            uint8_t buffer[BUFFER_LENGTH];
+
+            int len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+
+            if (len < 0) {
+                ESP_LOGE(tag, "recvfrom failed: errno %d", errno);
+                if (errno == EBADF) {
+                    // Invalid socket, set sock to -1 and clean up
+                    ESP_LOGE(tag, "Bad file descriptor, resetting socket");
+                    close(sock);
+                    sock = -1;
+                    continue; // Retry after cleanup
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue; // Retry in case of non-critical errors
+                }
+                break; // Exit loop for critical errors
+            } else {
+                buffer[len] = 0; // Null-terminate whatever we received and treat like a string
+                char addr_str[128];
+                inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr.s_addr, addr_str, sizeof(addr_str) - 1);
+                
+                if (strcmp(addr_str, CLIENT_IP) == 0) {
+                    // ESP_LOGI(tag, "Received %d bytes from %s:", len, addr_str);
+                    // ESP_LOGI(tag, "%s", buffer);
+                    
+                    // If you need to print as integers:
+                    // ESP_LOGI(tag, "Message as integers:");
+                    for (int i = 0; i < len; i++) {
+                        // printf("%d ", buffer[i]);
+                        if (buffer[i] == 255){
+                           ESP_LOGI(tag, "Received KeepAlive");
+                        }else{
+                            Status = (enum ScannerStatus) buffer[i];
+                        }
+                    }
+
+                    printf("\n");
+                }
+            }
+
+        } else {
+            ESP_LOGW(tag, "Socket is not valid, skipping recvfrom");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+        
+}
 
 
 
@@ -558,19 +788,61 @@ void app_main() {
     gpio_set_level(HORIZONTAL_DIR_PIN, 1);
 
     init_nvs();
-    recalibrate_vertical_rail();
     
-    // ESP_LOGI(tag, "ESP_WIFI_MODE_STA");
-    // wifi_init_sta();
+    ESP_LOGI(tag, "ESP_WIFI_MODE_STA");
+    wifi_init_sta();
+
+    status_queue = xQueueCreate(100, sizeof(uint8_t));
+    event_group = xEventGroupCreate();
+
+    if (status_queue == NULL) {
+        ESP_LOGE(tag, "Failed to create status queue");
+        return;
+    }
+
+    uint8_t updated_status = (uint8_t) INITIALIZING;
+
+    if (xQueueSend(status_queue, &updated_status, 0) == pdPASS) {
+        xEventGroupSetBits(event_group, STATUS_QUEUE_BIT);
+    }
+    
+    recalibrate_vertical_rail();
 
     QueueHandle_t xQueue;
     xQueue = xQueueCreate(100, sizeof(uint16_t)); 
+
+    point_queue = xQueueCreate(QUEUE_SIZE, sizeof(ScannerData));
+    if (point_queue == NULL) {
+        ESP_LOGE(tag, "Failed to create data queue");
+        return;
+    }
+
+    xTaskCreatePinnedToCore(
+        wifi_receiving_task,
+        "wifi_receiving_task",
+        4096,
+        NULL,
+        5,
+        NULL,
+        1  // Pin to Core 1
+    );
+
+    xTaskCreatePinnedToCore(
+        wifi_transmission_task,
+        "wifi_transmission_task",
+        4096,
+        NULL,
+        5,
+        NULL,
+        1  // Pin to Core 1
+    );
+
     
     xTaskCreate(update_vertical_position_task, "vertical_calibration", 2048, NULL, 5, NULL);
 
     // Create the find_range task
     xTaskCreate(
-                find_range,         // Function that implements the task
+        find_range,         // Function that implements the task
         "find_range_task",  // Text name for the task
         4096,               // Stack size in words
         (void *)xQueue,               // Task input parameter
@@ -586,11 +858,6 @@ void app_main() {
         (void *)xQueue,               // Task input parameter
         4,                  // Task priority
         NULL,
-        0               // Task handle
+        1               // Task handle
     );
-
-    init_gptimer(&horizontal_timer, HORIZONTAL_INTERVAL_SEC, horizontal_timer_isr_callback, &horizontal_timer);
-    init_gptimer(&vertical_timer, VERTICAL_INTERVAL_SEC, vertical_timer_isr_callback, &horizontal_timer);
-
-    gptimer_start(horizontal_timer);  // Start horizontal motor first
 }
