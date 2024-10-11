@@ -48,5 +48,6 @@
     "event_groups.h": "c",
     "esp_websocket_client.h": "c",
     "esp_timer.h": "c"
-  }
+  },
+  "cmake.sourceDirectory": "/home/ekamil/embedded/esp32/esp-idf-ssd1306/MeterDemo"
 }
